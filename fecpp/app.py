@@ -51,8 +51,10 @@ class CoastalPreprocessorApp(object):
         self.out_grid, self.out_bounds = self.__build_grid__(latitudes, longitudes)
 
     def regrid_all_files(self, output_path_transformer, var_filter=None, file_filter=None):
-        input_files = filter(file_filter, self.input_dir.glob("**"))
+        input_files = self.input_dir.glob(file_filter)
         for file in input_files:
+            if self.root:
+                print(f"Post-processing file: {file}", flush=True)
             self.regrid_to_lat_lon(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
 
     def regrid_to_lat_lon(self, input_file: Path, output_path_transformer, var_filter=None):
