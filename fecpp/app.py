@@ -135,7 +135,8 @@ class CoastalPreprocessorApp(object):
                 self.regridder = ESMF.Regrid(srcfield=in_field, dstfield=out_field,
                                              regrid_method=ESMF.RegridMethod.PATCH,
                                              unmapped_action=ESMF.UnmappedAction.IGNORE,
-                                             line_type=ESMF.LineType.GREAT_CIRCLE)
+                                             line_type=ESMF.LineType.GREAT_CIRCLE,
+                                             extrap_method=ESMF.api.constants.ExtrapMethod.NEAREST_STOD)
             else:
                 self.regridder(srcfield=in_field, dstfield=out_field, zero_region=ESMF.constants.Region.SELECT)
 
