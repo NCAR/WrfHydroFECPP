@@ -11,6 +11,8 @@ def main():
     comm = MPI.COMM_WORLD
     assert comm.Get_size() == ESMF.pet_count()
 
+    ESMF.Manager(debug=True)
+
     # find input forcings
     dir_date = os.environ["FORCING_BEGIN_DATE"]
     if len(dir_date) == 12:
@@ -21,7 +23,9 @@ def main():
     if ESMF.local_pet() == 0:
         print(f"Starting FECPP in {input_path}")
     
-    app = CoastalPreprocessorApp(input_path, Path(os.environ["GEOGRID_FILE"]))
+    schism_mesh = Path(os.environ["SCHISM_ESMFMESH"])
+
+    app = CoastalPreprocessorApp(input_path, Path(os.environ["GEOGRID_FILE"]), schism_mesh=schism_mesh)
     app.regrid_all_files(output_path_transformer=lambda x:x.with_suffix(".latlon.nc"),
                          var_filter=SeaLevelPressure,
                          file_filter="**/*LDASIN_DOMAIN*")

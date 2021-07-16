@@ -1,16 +1,16 @@
 from pathlib import Path
+import math
 
 import ESMF
-import mpi4py
 import numpy as np
 from netCDF4 import Dataset, default_fillvals
 
-
-comm = mpi4py.MPI.COMM_WORLD
-
+from mpi4py import MPI
+comm = MPI.COMM_WORLD
+comm.Set_errhandler(MPI.ERRORS_ARE_FATAL)
 
 class CoastalPreprocessorApp(object):
-    def __init__(self, input_dir: Path, geo_em_path: Path):
+    def __init__(self, input_dir: Path, geo_em_path: Path, schism_mesh: Path):
         self.geo = geo_em_path
         self.input_dir = input_dir
 
@@ -22,7 +22,15 @@ class CoastalPreprocessorApp(object):
         self._setup_latlon_grid_(ds)
         ds.close()
 
-        self.regridder = None       # placeholder
+        self.schism_mesh = ESMF.Mesh(filename=str(schism_mesh), filetype=ESMF.FileFormat.ESMFMESH)
+        self.schism_vsource = open(Path(input_dir / 'vsource.th.2'), 'w')
+        self.schism_first_timestep = None
+        self.schism_prev_time = -math.inf 
+
+        self._regridder = None          # placeholders
+        self._schism_regridder = None 
+        self.total_elements = 0
+        self.times = []
 
     def _setup_hydro_grid_(self, ds: Dataset):
         xlat = ds.variables['XLAT_M'][0, :]
@@ -43,8 +51,11 @@ class CoastalPreprocessorApp(object):
         lat_min, lat_max = xlat[:].min(), xlat[:].max()
         lon_min, lon_max = xlon[:].min(), xlon[:].max()
 
-        self.lats, d_lat = np.linspace(lat_min, lat_max, nlat, retstep=True)
-        self.lons, d_lon = np.linspace(lon_min, lon_max, nlon, retstep=True)
+        # self.lats, d_lat = np.linspace(lat_min, lat_max, nlat, retstep=True)
+        # self.lons, d_lon = np.linspace(lon_min, lon_max, nlon, retstep=True)
+        dlat = dlon = 0.01
+        self.lats = np.arange(math.floor(lat_min), math.ceil(lat_max)+dlat, dlat)
+        self.lons = np.arange(math.floor(lon_min), math.ceil(lon_max)+dlon, dlon)
 
         latitudes, longitudes = np.meshgrid(self.lats, self.lons, indexing="ij")
 
@@ -52,13 +63,89 @@ class CoastalPreprocessorApp(object):
 
     def regrid_all_files(self, output_path_transformer, var_filter=None, file_filter=None):
         input_files = self.input_dir.glob(file_filter)
-        for file in input_files:
+        for file in sorted(input_files):
             if self.root:
                 print(f"Post-processing file: {file}", flush=True)
             self.regrid_to_lat_lon(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
+            self.regrid_to_schism(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
+
+        # TODO: these could be made static...
+        if self.root:
+            self.make_schism_aux_inputs()
+
+    def regrid_to_schism(self, input_file: Path, output_path_transformer, var_filter=None):
+        input_ds = Dataset(input_file)
+        
+        nc_var = input_ds.variables['RAINRATE']
+        if var_filter is not None:
+            original_name = nc_var.name
+            nc_var = var_filter(nc_var, height=self.src_height)
+            if original_name != nc_var.name:
+                if self.root:
+                    print(f"Transforming variable `{original_name}` to `{nc_var.name}`")
+
+        in_field = ESMF.Field(grid=self.in_grid, name=f"rainrate-in")
+        y_lbounds, y_ubounds, x_lbounds, x_ubounds = self.in_bounds
+        in_field.data[...] = nc_var[0, y_lbounds:y_ubounds, x_lbounds:x_ubounds]
+
+        out_field = ESMF.Field(grid=self.schism_mesh, meshloc=ESMF.MeshLoc.ELEMENT, name=f"rainrate-out")
+        out_field.data[...] = -1
+        out_field.get_area()
+
+        if self.root:
+            print(f"Regridding output field `{nc_var.name}`"
+                    f"{' (generating initial spatial weights)' if not self._schism_regridder else ''}", flush=True)
+
+        if self._schism_regridder is None:
+            self._schism_regridder = ESMF.Regrid(srcfield=in_field, dstfield=out_field,
+                                                regrid_method=ESMF.RegridMethod.BILINEAR,
+                                                unmapped_action=ESMF.UnmappedAction.IGNORE,
+                                                extrap_method=ESMF.ExtrapMethod.CREEP_FILL)
+                                                        
+        out_field = self._schism_regridder(srcfield=in_field, dstfield=out_field) #, zero_region=ESMF.constants.Region.SELECT)
+        
+        # TEXT OUTPUT STAGE
+
+        #   get element counts
+        local_element_count = np.asarray([self.schism_mesh.size[1]], dtype='i')
+        global_element_counts = np.empty((ESMF.pet_count(),), dtype='i')
+        comm.Gather(local_element_count, global_element_counts)
+        
+        #   collect data from each rank
+        if self.root:
+            self.total_elements = global_element_counts.sum()
+            all_elements = np.empty((self.total_elements,))
+        else:
+            all_elements = None
+
+        comm.Gatherv(sendbuf=out_field.data, recvbuf=(all_elements, global_element_counts))
+
+        #   write field data to `vsource.th.2`
+        if self.root:
+            # TODO: currently these are in the input field in minutes, so convert to seconds
+            # TODO: we really should read actual time unit from metadata using udunits, etc.
+            step_time = input_ds['time'][0] * 60
+
+            # assert step_time > self.schism_prev_time, "ERROR: forcings time not increasing monotonically"
+            self.schism_prev_time = step_time     
+            if self.schism_first_timestep is None:
+                self.schism_first_timestep = step_time
+
+            output_ts = int(step_time - self.schism_first_timestep)
+            self.times.append(output_ts)
+            self.schism_vsource.write(f"{output_ts}")
+
+            for i in range(all_elements.size):
+                 self.schism_vsource.write(f" {all_elements[i]}")
+            
+            self.schism_vsource.write("\n")
+            self.schism_vsource.flush()         # TODO: add a proper close() call after last timestep!
+
+        comm.Barrier()
+
 
     def regrid_to_lat_lon(self, input_file: Path, output_path_transformer, var_filter=None):
-        hydro_vars = ['U2D', 'V2D', 'LWDOWN', 'RAINRATE', 'T2D', 'Q2D', 'PSFC', 'SWDOWN', 'LQFRAC']
+        ll_vars = ['U2D', 'V2D', 'LWDOWN', 'T2D', 'Q2D', 'PSFC', 'SWDOWN', 'LQFRAC']
 
         input_ds = Dataset(input_file)
 
@@ -97,7 +184,7 @@ class CoastalPreprocessorApp(object):
         else:
             output_ds = lat_coord = lon_coord = in_time = time_coord = None
 
-        for variable in hydro_vars:
+        for variable in ll_vars:
             if variable not in input_ds.variables:
                 continue
 
@@ -129,16 +216,16 @@ class CoastalPreprocessorApp(object):
 
             if self.root:
                 print(f"Regridding output field `{nc_var.name}`"
-                      f"{' (generating initial spatial weights)' if not self.regridder else ''}", flush=True)
+                      f"{' (generating initial spatial weights)' if not self._regridder else ''}", flush=True)
 
-            if self.regridder is None:
-                self.regridder = ESMF.Regrid(srcfield=in_field, dstfield=out_field,
-                                             regrid_method=ESMF.RegridMethod.PATCH,
-                                             unmapped_action=ESMF.UnmappedAction.IGNORE,
-                                             line_type=ESMF.LineType.GREAT_CIRCLE,
-                                             extrap_method=ESMF.api.constants.ExtrapMethod.NEAREST_STOD)
+            if self._regridder is None:
+                self._regridder = ESMF.Regrid(srcfield=in_field, dstfield=out_field,
+                                              regrid_method=ESMF.RegridMethod.BILINEAR,
+                                              unmapped_action=ESMF.UnmappedAction.IGNORE,
+                                              line_type=ESMF.LineType.GREAT_CIRCLE,
+                                              extrap_method=ESMF.api.constants.ExtrapMethod.NEAREST_STOD)
             else:
-                self.regridder(srcfield=in_field, dstfield=out_field, zero_region=ESMF.constants.Region.SELECT)
+                self._regridder(srcfield=in_field, dstfield=out_field, zero_region=ESMF.constants.Region.SELECT)
 
             # assemble output field
             global_output = np.zeros((nlats, nlons))
@@ -160,6 +247,22 @@ class CoastalPreprocessorApp(object):
             lon_coord[:] = self.lons
             time_coord[:] = in_time[:]
             output_ds.close()
+        
+        input_ds.close()
+
+    def make_schism_aux_inputs(self):
+        with open(self.input_dir / 'source_sink.in.2', 'w') as o:
+            o.write(f"{self.total_elements}\n")
+            o.write('\n'.join(map(str, range(1, self.total_elements+1))))
+            o.write('\n'+'0')
+
+        with open(self.input_dir / 'msource.th.2', 'w') as o:
+            for i in range(len(self.times)):
+                o.write(f"{self.times[i]}\t")
+                o.write('\t'.join(["-9999"] * self.total_elements))
+                o.write('\n')
+                o.write('\t'.join(["0"] * self.total_elements))
+                o.write('\n')
 
     # INTERNAL METHODS
 
@@ -190,3 +293,4 @@ class CoastalPreprocessorApp(object):
         lat_coord[...] = lat_par
 
         return grid, (y_lbounds, y_ubounds, x_lbounds, x_ubounds)
+        
