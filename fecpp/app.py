@@ -4,13 +4,16 @@ import math
 import ESMF
 import numpy as np
 from netCDF4 import Dataset, default_fillvals
-
+from os import path
 from mpi4py import MPI
 comm = MPI.COMM_WORLD
 comm.Set_errhandler(MPI.ERRORS_ARE_FATAL)
 
 class CoastalPreprocessorApp(object):
     def __init__(self, input_dir: Path, geo_em_path: Path, schism_mesh: Path):
+        if (ESMF.version_compare(ESMF.__version__,'8.1.0') < 0):
+            raise('ESMF version needs to be 8.1.0 or greater. Current version is ',
+                  ESMF.__version__)
         self.geo = geo_em_path
         self.input_dir = input_dir
 
@@ -25,10 +28,10 @@ class CoastalPreprocessorApp(object):
         self.schism_mesh = ESMF.Mesh(filename=str(schism_mesh), filetype=ESMF.FileFormat.ESMFMESH)
         self.schism_vsource = open(Path(input_dir / 'vsource.th.2'), 'w')
         self.schism_first_timestep = None
-        self.schism_prev_time = -math.inf 
+        self.schism_prev_time = -math.inf
 
         self._regridder = None          # placeholders
-        self._schism_regridder = None 
+        self._schism_regridder = None
         self.total_elements = 0
         self.times = []
 
@@ -62,20 +65,26 @@ class CoastalPreprocessorApp(object):
         self.out_grid, self.out_bounds = self.__build_grid__(latitudes, longitudes)
 
     def regrid_all_files(self, output_path_transformer, var_filter=None, file_filter=None):
-        input_files = self.input_dir.glob(file_filter)
-        for file in sorted(input_files):
+        sorted_input_files = sorted(self.input_dir.glob(file_filter))
+        num_input_files = len(sorted_input_files)
+        for i, file in enumerate(sorted_input_files, start=1):
             if self.root:
                 print(f"Post-processing file: {file}", flush=True)
             self.regrid_to_lat_lon(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
             self.regrid_to_schism(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
 
-        # TODO: these could be made static...
-        if self.root:
-            self.make_schism_aux_inputs()
+            # moved comm.Barrier() from self.regrid_to_schism() so make_schism_aux_inputs() can run
+            #   while last input is being writter
+            if (i == num_input_files):
+                if (ESMF.pet_count() > 1) and (ESMF.local_pet() == 1):
+                    self.make_schism_aux_inputs()
+                elif (ESMF.pet_count() == 1) and (self.root):
+                    self.make_schism_aux_inputs()
+            comm.Barrier()
 
     def regrid_to_schism(self, input_file: Path, output_path_transformer, var_filter=None):
         input_ds = Dataset(input_file)
-        
+
         nc_var = input_ds.variables['RAINRATE']
         if var_filter is not None:
             original_name = nc_var.name
@@ -101,23 +110,22 @@ class CoastalPreprocessorApp(object):
                                                 regrid_method=ESMF.RegridMethod.BILINEAR,
                                                 unmapped_action=ESMF.UnmappedAction.IGNORE,
                                                 extrap_method=ESMF.ExtrapMethod.CREEP_FILL)
-                                                        
+
         out_field = self._schism_regridder(srcfield=in_field, dstfield=out_field) #, zero_region=ESMF.constants.Region.SELECT)
-        
+
         # TEXT OUTPUT STAGE
 
         #   get element counts
         local_element_count = np.asarray([self.schism_mesh.size[1]], dtype='i')
         global_element_counts = np.empty((ESMF.pet_count(),), dtype='i')
         comm.Gather(local_element_count, global_element_counts)
-        
+
         #   collect data from each rank
         if self.root:
             self.total_elements = global_element_counts.sum()
             all_elements = np.empty((self.total_elements,))
         else:
             all_elements = None
-
         comm.Gatherv(sendbuf=out_field.data, recvbuf=(all_elements, global_element_counts))
 
         #   write field data to `vsource.th.2`
@@ -127,7 +135,7 @@ class CoastalPreprocessorApp(object):
             step_time = input_ds['time'][0] * 60
 
             # assert step_time > self.schism_prev_time, "ERROR: forcings time not increasing monotonically"
-            self.schism_prev_time = step_time     
+            self.schism_prev_time = step_time
             if self.schism_first_timestep is None:
                 self.schism_first_timestep = step_time
 
@@ -137,11 +145,12 @@ class CoastalPreprocessorApp(object):
 
             for i in range(all_elements.size):
                  self.schism_vsource.write(f" {all_elements[i]}")
-            
+
             self.schism_vsource.write("\n")
             self.schism_vsource.flush()         # TODO: add a proper close() call after last timestep!
 
-        comm.Barrier()
+        # moved barrier outside of regrid_to_schism so make_schism_aux_inputs can be run in parallel
+        # comm.Barrier()
 
 
     def regrid_to_lat_lon(self, input_file: Path, output_path_transformer, var_filter=None):
@@ -247,14 +256,17 @@ class CoastalPreprocessorApp(object):
             lon_coord[:] = self.lons
             time_coord[:] = in_time[:]
             output_ds.close()
-        
+
         input_ds.close()
 
     def make_schism_aux_inputs(self):
-        with open(self.input_dir / 'source_sink.in.2', 'w') as o:
-            o.write(f"{self.total_elements}\n")
-            o.write('\n'.join(map(str, range(1, self.total_elements+1))))
-            o.write('\n'+'0')
+        sink_file = self.input_dir / 'source_sink.in.2'
+        file_elements = open(sink_file).readline() if path.exists(sink_file) else -1
+        if (int(file_elements) != self.total_elements):
+            with open(sink_file, 'w') as o:
+                o.write(f"{self.total_elements}\n")
+                o.write('\n'.join(map(str, range(1, self.total_elements+1))))
+                o.write('\n'+'0')
 
         with open(self.input_dir / 'msource.th.2', 'w') as o:
             for i in range(len(self.times)):
@@ -293,4 +305,3 @@ class CoastalPreprocessorApp(object):
         lat_coord[...] = lat_par
 
         return grid, (y_lbounds, y_ubounds, x_lbounds, x_ubounds)
-        
