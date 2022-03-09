@@ -1,5 +1,8 @@
+import os
 from pathlib import Path
 import math
+from threading import Thread
+from queue import Queue
 
 import ESMF
 import numpy as np
@@ -11,14 +14,37 @@ comm.Set_errhandler(MPI.ERRORS_ARE_FATAL)
 
 
 class CoastalPreprocessorApp(object):
-    def __init__(self, input_dir: Path, geo_em_path: Path, schism_mesh: Path):
+    def __init__(self, input_dir: Path, output_dir: Path, geo_em_path: Path, schism_mesh: Path):
         self.geo = geo_em_path
         self.input_dir = input_dir
+        self.output_dir = output_dir
+
+        self.job_idx = os.environ.get("FECPP_JOB_INDEX")
+        self.job_count = os.environ.get("FECPP_JOB_COUNT")
 
         self.root = ESMF.local_pet() == 0
-        
+
+        if self.root:
+            self.queue = Queue()
+
+            def queue_worker():
+                while True:
+                    print("getting queue item")
+                    output_ts, all_elements = self.queue.get()
+                    print("processing queue item")
+                    self.schism_vsource.write(f"{output_ts} ")
+                    self.schism_vsource.write(" ".join(map(lambda v: "{:g}".format(v), all_elements)))
+                    self.schism_vsource.write("\n")
+                    self.schism_vsource.flush()
+                    self.queue.task_done()
+                    print("finished queue item")
+            Thread(target=queue_worker, daemon=True).start()
+            
         self.schism_mesh = ESMF.Mesh(filename=str(schism_mesh), filetype=ESMF.FileFormat.ESMFMESH)
-        self.schism_vsource = open(Path(input_dir / 'vsource.th.2'), 'w')
+        output_file = 'vsource.th.2'
+        if self.job_idx is not None:
+            output_file += f".part{int(self.job_idx):04}"
+        self.schism_vsource = open(Path(output_dir / output_file), 'w')
         self.schism_first_timestep = None
         self.schism_prev_time = -math.inf
         
@@ -37,22 +63,31 @@ class CoastalPreprocessorApp(object):
         self.times = []
 
     def regrid_all_files(self, output_path_transformer, var_filter=None, file_filter=None):
-        input_files = self.input_dir.glob(file_filter)
-        for file in sorted(input_files):
+        input_files = sorted(self.input_dir.glob(file_filter))
+        if self.job_idx is not None:
+            idx = int(self.job_idx)
+            jobs = int(self.job_count)
+            count = math.ceil(len(input_files) / jobs)
+
+            input_files = input_files[idx*count: idx*count+count]
+
+        for file in input_files:
             if self.root:
                 print(f"Post-processing file: {file}", flush=True)
             self.regrid_to_lat_lon(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
             self.regrid_to_schism(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
-    
-        # TODO: these could be made static...
+
         if self.root:
+            self.queue.join()
+
+            # TODO: these could be made static...
             self.make_schism_aux_inputs()
-        
+
         self.schism_vsource.close()  # TODO: this should be called for single-file too!
 
     def regrid_to_schism(self, input_file: Path, output_path_transformer, var_filter=None):
         input_ds = Dataset(input_file)
-        
+
         nc_var = input_ds.variables['RAINRATE']
         if var_filter is not None:
             original_name = nc_var.name
@@ -105,6 +140,8 @@ class CoastalPreprocessorApp(object):
                 step_time = input_ds['time'][0] * 60        # in minutes
             if 'valid_time' in input_ds.variables:
                 step_time = input_ds['valid_time'][0]       # in seconds
+    
+            print(f"Writing vsource for step_time={step_time}")
 
             # assert step_time > self.schism_prev_time, "ERROR: forcings time not increasing monotonically"
             self.schism_prev_time = step_time
@@ -113,15 +150,15 @@ class CoastalPreprocessorApp(object):
 
             output_ts = int(step_time - self.schism_first_timestep)
             self.times.append(output_ts)
-            self.schism_vsource.write(f"{output_ts}")
-
-            for i in range(all_elements.size):
-                self.schism_vsource.write(f" {all_elements[i]}")
-
+            self.schism_vsource.write(f"{output_ts} ")
+            self.schism_vsource.write(" ".join(map(lambda v: "{:g}".format(v), all_elements)))
             self.schism_vsource.write("\n")
             self.schism_vsource.flush()
+            # self.queue.put((output_ts, all_elements))
 
-        comm.Barrier()
+        # comm.Barrier()
+        in_field.destroy()
+        out_field.destroy()
         input_ds.close()
 
     def regrid_to_lat_lon(self, input_file: Path, output_path_transformer, var_filter=None):
@@ -229,12 +266,14 @@ class CoastalPreprocessorApp(object):
         input_ds.close()
         
     def make_schism_aux_inputs(self):
-        with open(self.input_dir / 'source_sink.in.2', 'w') as o:
-            o.write(f"{self.total_elements}\n")
-            o.write('\n'.join(map(str, range(1, self.total_elements+1))))
-            o.write('\n'+'0')
+        if self.job_idx is None or int(self.job_idx) == 0:
+            with open(self.output_dir / 'source_sink.in.2', 'w') as o:
+                o.write(f"{self.total_elements}\n")
+                o.write('\n'.join(map(str, range(1, self.total_elements+1))))
+                o.write('\n'+'0')
 
-        with open(self.input_dir / 'msource.th.2', 'w') as o:
+        suffix = "" if self.job_idx is None else f".part{int(self.job_idx):04}"
+        with open(self.output_dir / ('msource.th.2' + suffix), 'w') as o:
             for i in range(len(self.times)):
                 o.write(f"{self.times[i]}\t")
                 o.write('\t'.join(["-9999"] * self.total_elements))
