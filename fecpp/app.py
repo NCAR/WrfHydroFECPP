@@ -69,6 +69,19 @@ class CoastalPreprocessorApp(object):
             jobs = int(self.job_count)
             count = math.ceil(len(input_files) / jobs)
 
+            if self.root:
+                file_zero = input_files[0]
+                input_ds = Dataset(file_zero)
+
+                # TODO: we really should read actual time unit from metadata using udunits, etc.            
+                if 'time' in input_ds.variables:
+                    start_time = input_ds['time'][0] * 60        # in minutes
+                if 'valid_time' in input_ds.variables:
+                    start_time = input_ds['valid_time'][0]       # in seconds
+
+                self.schism_first_timestep = start_time
+                input_ds.close()
+
             input_files = input_files[idx*count: idx*count+count]
 
         for file in input_files:
@@ -98,11 +111,10 @@ class CoastalPreprocessorApp(object):
 
         in_field = ESMF.Field(grid=self.in_grid, name=f"rainrate-in")
         y_lbounds, y_ubounds, x_lbounds, x_ubounds = self.in_bounds
-        in_field.data[...] = nc_var[0, y_lbounds:y_ubounds, x_lbounds:x_ubounds]
+        in_field.data[...] = nc_var[0, :].T[x_lbounds:x_ubounds, y_lbounds:y_ubounds]
 
         out_field = ESMF.Field(grid=self.schism_mesh, meshloc=ESMF.MeshLoc.ELEMENT, name=f"rainrate-out")
         out_field.data[...] = -1
-        out_field.get_area()
 
         if self.root:
             print(f"Regridding output field `{nc_var.name}`"
@@ -112,10 +124,19 @@ class CoastalPreprocessorApp(object):
             self._schism_regridder = ESMF.Regrid(srcfield=in_field, dstfield=out_field,
                                                  regrid_method=ESMF.RegridMethod.BILINEAR,
                                                  unmapped_action=ESMF.UnmappedAction.IGNORE,
-                                                 extrap_method=ESMF.ExtrapMethod.CREEP_FILL)
+                                                 extrap_method=ESMF.ExtrapMethod.NONE)
 
         out_field = self._schism_regridder(srcfield=in_field, dstfield=out_field)  # , zero_region=ESMF.constants.Region.SELECT)
         out_field.data[...] = np.where(out_field.data[...] > 0, out_field.data[...], 0)
+
+        # convert to volumetric flux (m^3/s)
+        R0_SCHISM = 6378206.4           # earth radius in meters used by SCHISM
+        DENSITY_FACTOR = 1000
+
+        unit_areas = ESMF.Field(self.schism_mesh, meshloc=ESMF.MeshLoc.ELEMENT, name='areafield')
+        unit_areas.get_area()
+        areas_m2 = unit_areas.data[...] * (R0_SCHISM * R0_SCHISM)
+        out_field.data[...] *= (areas_m2 / DENSITY_FACTOR)
 
         # TEXT OUTPUT STAGE
 
@@ -127,7 +148,7 @@ class CoastalPreprocessorApp(object):
         #   collect data from each rank
         if self.root:
             self.total_elements = global_element_counts.sum()
-            all_elements = np.empty((self.total_elements,))
+            all_elements = np.zeros((self.total_elements,))
         else:
             all_elements = None
 
@@ -140,13 +161,11 @@ class CoastalPreprocessorApp(object):
                 step_time = input_ds['time'][0] * 60        # in minutes
             if 'valid_time' in input_ds.variables:
                 step_time = input_ds['valid_time'][0]       # in seconds
-    
+
             print(f"Writing vsource for step_time={step_time}")
 
             # assert step_time > self.schism_prev_time, "ERROR: forcings time not increasing monotonically"
             self.schism_prev_time = step_time
-            if self.schism_first_timestep is None:
-                self.schism_first_timestep = step_time
 
             output_ts = int(step_time - self.schism_first_timestep)
             self.times.append(output_ts)
@@ -155,6 +174,8 @@ class CoastalPreprocessorApp(object):
             self.schism_vsource.write("\n")
             self.schism_vsource.flush()
             # self.queue.put((output_ts, all_elements))
+
+        # print(f"FECPP wrote {(self.times[-1] - self.times[0]) / 3600.0 } hours of data to vsource.th", flush=True)
 
         # comm.Barrier()
         in_field.destroy()
@@ -166,7 +187,7 @@ class CoastalPreprocessorApp(object):
 
         input_ds = Dataset(input_file)
 
-        nlats, nlons = self.out_grid.max_index
+        nlons, nlats = self.out_grid.max_index
 
         if self.root:
             output_ds = Dataset(output_path_transformer(input_file), 'w')
@@ -226,7 +247,8 @@ class CoastalPreprocessorApp(object):
 
             in_field = ESMF.Field(grid=self.in_grid, name=f"{variable}-in")
             y_lbounds, y_ubounds, x_lbounds, x_ubounds = self.in_bounds
-            in_field.data[...] = nc_var[0, y_lbounds:y_ubounds, x_lbounds:x_ubounds]
+            
+            in_field.data[...] = nc_var[0, :].T[x_lbounds:x_ubounds, y_lbounds:y_ubounds]
 
             out_field = ESMF.Field(grid=self.out_grid, name=f"{variable}-out")
             out_field.data[...] = 0.0  # default_fillvals['f4']
@@ -244,16 +266,16 @@ class CoastalPreprocessorApp(object):
                 self._regridder(srcfield=in_field, dstfield=out_field, zero_region=ESMF.constants.Region.SELECT)
 
             # assemble output field
-            global_output = np.zeros((nlats, nlons))
+            global_output = np.zeros((nlons, nlats))
             y_lbounds, y_ubounds, x_lbounds, x_ubounds = self.out_bounds
-            global_output[y_lbounds:y_ubounds, x_lbounds:x_ubounds] = out_field.data[...]
+            global_output[x_lbounds:x_ubounds, y_lbounds:y_ubounds] = out_field.data[...]
 
-            final_output = np.empty((nlats, nlons))
+            final_output = np.empty((nlons, nlats))
             comm.Reduce(global_output.data, final_output.data)
             # comm.Barrier()
 
             if self.root:
-                output_ds.variables[nc_var.name][0, :] = final_output
+                output_ds.variables[nc_var.name][0, :] = final_output.T
 
             in_field.destroy()
             out_field.destroy()
@@ -273,21 +295,25 @@ class CoastalPreprocessorApp(object):
                 o.write('\n'+'0')
 
         suffix = "" if self.job_idx is None else f".part{int(self.job_idx):04}"
+        line_one = '\t'.join(["-9999"] * self.total_elements)
+        line_two = '\t'.join(["0"] * self.total_elements)
         with open(self.output_dir / ('msource.th.2' + suffix), 'w') as o:
             for i in range(len(self.times)):
                 o.write(f"{self.times[i]}\t")
-                o.write('\t'.join(["-9999"] * self.total_elements))
+                o.write(line_one)
                 o.write('\n')
-                o.write('\t'.join(["0"] * self.total_elements))
+                o.write(line_two)
                 o.write('\n')
 
     # INTERNAL METHODS
 
     def _setup_hydro_grid_(self, ds: Dataset):
-        xlat = ds.variables['XLAT_M'][0, :]
-        xlon = ds.variables['XLONG_M'][0, :]
-
-        self.in_grid, self.in_bounds = self._build_grid_(xlat, xlon)
+        xlat = ds.variables['XLAT_M'][0, :].T
+        xlon = ds.variables['XLONG_M'][0, :].T
+        clat = ds.variables['XLAT_C'][0, :].T
+        clon = ds.variables['XLONG_C'][0, :].T
+        
+        self.in_grid, self.in_bounds = self._build_grid_(xlat, xlon, clat, clon)
 
     def _setup_latlon_grid_(self, ds: Dataset):
         xlat = ds.variables['XLAT_V']
@@ -308,10 +334,10 @@ class CoastalPreprocessorApp(object):
         # self.lats, d_lat = np.linspace(lat_min, lat_max, nlat, retstep=True)
         # self.lons, d_lon = np.linspace(lon_min, lon_max, nlon, retstep=True)
         dlat = dlon = 0.01
-        self.lats = np.arange(math.floor(lat_min), math.ceil(lat_max)+dlat, dlat)
-        self.lons = np.arange(math.floor(lon_min), math.ceil(lon_max)+dlon, dlon)
+        self.lats = np.arange(math.floor(lat_min/dlat)*dlat, (math.ceil(lat_max/dlat)*dlat)+dlat, dlat)
+        self.lons = np.arange(math.floor(lon_min/dlon)*dlon, (math.ceil(lon_max/dlon)*dlon)+dlon, dlon)
 
-        latitudes, longitudes = np.meshgrid(self.lats, self.lons, indexing="ij")
+        longitudes, latitudes = np.meshgrid(self.lons, self.lats, indexing="ij")
 
         self.out_grid, self.out_bounds = self._build_grid_(latitudes, longitudes)
         
@@ -330,14 +356,14 @@ class CoastalPreprocessorApp(object):
         return (g_lat_min[0], g_lat_max[0]), (g_lon_min[0], g_lon_max[0])
 
     @staticmethod
-    def _build_grid_(latitudes: np.ndarray, longitudes: np.ndarray):
-        lat, lon = 0, 1  # Labels for coordinate axes
+    def _build_grid_(latitudes: np.ndarray, longitudes: np.ndarray, corner_lats: np.ndarray = None, corner_lons: np.ndarray = None):
+        lon, lat = 0, 1  # Labels for coordinate axes
+        nlon, nlat = latitudes.shape
 
-        nlat, nlon = latitudes.shape
-
+        stagger = [ESMF.StaggerLoc.CENTER, ESMF.StaggerLoc.CORNER] if corner_lats is not None else [ESMF.StaggerLoc.CENTER]
         # noinspection PyTypeChecker
-        grid = ESMF.Grid(np.array([nlat, nlon]),
-                         staggerloc=[ESMF.StaggerLoc.CENTER],
+        grid = ESMF.Grid(np.array([nlon, nlat]),
+                         staggerloc=stagger,
                          coord_sys=ESMF.CoordSys.SPH_DEG)
 
         y_lbounds = grid.lower_bounds[ESMF.StaggerLoc.CENTER][lat]
@@ -345,15 +371,31 @@ class CoastalPreprocessorApp(object):
         x_lbounds = grid.lower_bounds[ESMF.StaggerLoc.CENTER][lon]
         x_ubounds = grid.upper_bounds[ESMF.StaggerLoc.CENTER][lon]
 
+        if corner_lons is not None and corner_lats is not None:
+            yc_lbounds = grid.lower_bounds[ESMF.StaggerLoc.CORNER][lat]
+            yc_ubounds = grid.upper_bounds[ESMF.StaggerLoc.CORNER][lat]
+            xc_lbounds = grid.lower_bounds[ESMF.StaggerLoc.CORNER][lon]
+            xc_ubounds = grid.upper_bounds[ESMF.StaggerLoc.CORNER][lon]
+
         # print(f"[{ESMF.local_pet()+1} of {ESMF.pet_count()}] =>", x_lbounds, x_ubounds, y_lbounds, y_ubounds)
 
         lon_coord = grid.get_coords(lon)
-        lon_par = longitudes[y_lbounds:y_ubounds, x_lbounds:x_ubounds]
+        lon_par = longitudes[x_lbounds:x_ubounds, y_lbounds:y_ubounds]
         lon_coord[...] = lon_par
 
+        if corner_lons is not None:
+            lon_corners = grid.get_coords(lon, staggerloc=ESMF.StaggerLoc.CORNER)
+            lonc_par = corner_lons[xc_lbounds:xc_ubounds, yc_lbounds:yc_ubounds]
+            lon_corners[...] = lonc_par
+
         lat_coord = grid.get_coords(lat)
-        lat_par = latitudes[y_lbounds:y_ubounds, x_lbounds:x_ubounds]
+        lat_par = latitudes[x_lbounds:x_ubounds, y_lbounds:y_ubounds]
         lat_coord[...] = lat_par
+
+        if corner_lats is not None:
+            lat_corners = grid.get_coords(lat, staggerloc=ESMF.StaggerLoc.CORNER)
+            latc_par = corner_lats[xc_lbounds:xc_ubounds, yc_lbounds:yc_ubounds]
+            lat_corners[...] = latc_par
 
         return grid, (y_lbounds, y_ubounds, x_lbounds, x_ubounds)
         
