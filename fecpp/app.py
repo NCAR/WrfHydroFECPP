@@ -68,21 +68,20 @@ class CoastalPreprocessorApp(object):
             idx = int(self.job_idx)
             jobs = int(self.job_count)
             count = math.ceil(len(input_files) / jobs)
-
-            if self.root:
-                file_zero = input_files[0]
-                input_ds = Dataset(file_zero)
-
-                # TODO: we really should read actual time unit from metadata using udunits, etc.            
-                if 'time' in input_ds.variables:
-                    start_time = input_ds['time'][0] * 60        # in minutes
-                if 'valid_time' in input_ds.variables:
-                    start_time = input_ds['valid_time'][0]       # in seconds
-
-                self.schism_first_timestep = start_time
-                input_ds.close()
-
             input_files = input_files[idx*count: idx*count+count]
+
+        if self.root:
+            file_zero = input_files[0]
+            input_ds = Dataset(file_zero)
+
+            # TODO: we really should read actual time unit from metadata using udunits, etc.            
+            if 'time' in input_ds.variables:
+                start_time = input_ds['time'][0] * 60        # in minutes
+            if 'valid_time' in input_ds.variables:
+                start_time = input_ds['valid_time'][0]       # in seconds
+
+            self.schism_first_timestep = start_time
+            input_ds.close()
 
         for file in input_files:
             if self.root:
@@ -165,6 +164,7 @@ class CoastalPreprocessorApp(object):
             print(f"Writing vsource for step_time={step_time}")
 
             # assert step_time > self.schism_prev_time, "ERROR: forcings time not increasing monotonically"
+            # print(f"self.schism_prev_time = {self.schism_prev_time},  step_time = {step_time}", flush=True)
             self.schism_prev_time = step_time
 
             output_ts = int(step_time - self.schism_first_timestep)
@@ -293,6 +293,7 @@ class CoastalPreprocessorApp(object):
                 o.write(f"{self.total_elements}\n")
                 o.write('\n'.join(map(str, range(1, self.total_elements+1))))
                 o.write('\n'+'0')
+                o.flush()
 
         suffix = "" if self.job_idx is None else f".part{int(self.job_idx):04}"
         line_one = '\t'.join(["-9999"] * self.total_elements)
@@ -304,6 +305,7 @@ class CoastalPreprocessorApp(object):
                 o.write('\n')
                 o.write(line_two)
                 o.write('\n')
+            o.flush()
 
     # INTERNAL METHODS
 
