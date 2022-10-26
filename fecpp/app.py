@@ -64,6 +64,7 @@ class CoastalPreprocessorApp(object):
 
     def regrid_all_files(self, output_path_transformer, var_filter=None, file_filter=None):
         input_files = sorted(self.input_dir.glob(file_filter))
+        file_zero = input_files[0]
         if self.job_idx is not None:
             idx = int(self.job_idx)
             jobs = int(self.job_count)
@@ -71,7 +72,6 @@ class CoastalPreprocessorApp(object):
             input_files = input_files[idx*count: idx*count+count]
 
         if self.root:
-            file_zero = input_files[0]
             input_ds = Dataset(file_zero)
 
             # TODO: we really should read actual time unit from metadata using udunits, etc.            
