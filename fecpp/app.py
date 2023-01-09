@@ -19,35 +19,16 @@ class CoastalPreprocessorApp(object):
         self.input_dir = input_dir
         self.output_dir = output_dir
 
-        self.job_idx = os.environ.get("FECPP_JOB_INDEX")
-        self.job_count = os.environ.get("FECPP_JOB_COUNT")
+        # self.job_idx = os.environ.get("FECPP_JOB_INDEX")
+        # self.job_count = os.environ.get("FECPP_JOB_COUNT")
 
         self.root = ESMF.local_pet() == 0
-
-        if self.root:
-            self.queue = Queue()
-
-            def queue_worker():
-                while True:
-                    print("getting queue item")
-                    output_ts, all_elements = self.queue.get()
-                    print("processing queue item")
-                    self.schism_vsource.write(f"{output_ts} ")
-                    self.schism_vsource.write(" ".join(map(lambda v: "{:g}".format(v), all_elements)))
-                    self.schism_vsource.write("\n")
-                    self.schism_vsource.flush()
-                    self.queue.task_done()
-                    print("finished queue item")
-            Thread(target=queue_worker, daemon=True).start()
-            
         self.schism_mesh = ESMF.Mesh(filename=str(schism_mesh), filetype=ESMF.FileFormat.ESMFMESH)
-        output_file = 'vsource.th.2'
-        if self.job_idx is not None:
-            output_file += f".part{int(self.job_idx):04}"
-        self.schism_vsource = open(Path(output_dir / output_file), 'w')
         self.schism_first_timestep = None
         self.schism_prev_time = -math.inf
-        
+        with Dataset(schism_mesh, 'r') as smesh:
+            self.total_elements = smesh.dimensions['elementCount'].size
+
         node_coords = self.schism_mesh.coords[0]
         self.out_lat_range, self.out_lon_range = self._find_lat_lon_ranges_(node_coords)
 
@@ -59,17 +40,11 @@ class CoastalPreprocessorApp(object):
 
         self._regridder = None          # placeholders
         self._schism_regridder = None
-        self.total_elements = 0
         self.times = []
 
     def regrid_all_files(self, output_path_transformer, var_filter=None, file_filter=None):
         input_files = sorted(self.input_dir.glob(file_filter))
         file_zero = input_files[0]
-        if self.job_idx is not None:
-            idx = int(self.job_idx)
-            jobs = int(self.job_count)
-            count = math.ceil(len(input_files) / jobs)
-            input_files = input_files[idx*count: idx*count+count]
 
         if self.root:
             input_ds = Dataset(file_zero)
@@ -83,6 +58,10 @@ class CoastalPreprocessorApp(object):
             self.schism_first_timestep = start_time
             input_ds.close()
 
+            # open netCDF vsource file and create header
+            self.schism_vsource = Dataset(Path(self.output_dir / "precip_source.nc"), 'w', format="NETCDF4")
+            self._build_source_nc(self.schism_vsource, ntimes=len(input_files), elems=np.arange(1, self.total_elements+1))
+
         for file in input_files:
             if self.root:
                 print(f"Post-processing file: {file}", flush=True)
@@ -90,12 +69,8 @@ class CoastalPreprocessorApp(object):
             self.regrid_to_schism(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
 
         if self.root:
-            self.queue.join()
-
-            # TODO: these could be made static...
-            self.make_schism_aux_inputs()
-
-        self.schism_vsource.close()  # TODO: this should be called for single-file too!
+            self.schism_vsource.sync()
+            self.schism_vsource.close()
 
     def regrid_to_schism(self, input_file: Path, output_path_transformer, var_filter=None):
         input_ds = Dataset(input_file)
@@ -137,8 +112,6 @@ class CoastalPreprocessorApp(object):
         areas_m2 = unit_areas.data[...] * (R0_SCHISM * R0_SCHISM)
         out_field.data[...] *= (areas_m2 / DENSITY_FACTOR)
 
-        # TEXT OUTPUT STAGE
-
         #   get element counts
         local_element_count = np.asarray([self.schism_mesh.size[1]], dtype='i')
         global_element_counts = np.empty((ESMF.pet_count(),), dtype='i')
@@ -155,7 +128,7 @@ class CoastalPreprocessorApp(object):
 
         #   write field data to `vsource.th.2`
         if self.root:
-            # TODO: we really should read actual time unit from metadata using udunits, etc.            
+            # TODO: we really should read actual time unit from metadata using udunits, etc.       
             if 'time' in input_ds.variables:
                 step_time = input_ds['time'][0] * 60        # in minutes
             if 'valid_time' in input_ds.variables:
@@ -163,17 +136,14 @@ class CoastalPreprocessorApp(object):
 
             print(f"Writing vsource for step_time={step_time}")
 
-            # assert step_time > self.schism_prev_time, "ERROR: forcings time not increasing monotonically"
-            # print(f"self.schism_prev_time = {self.schism_prev_time},  step_time = {step_time}", flush=True)
-            self.schism_prev_time = step_time
+            # # assert step_time > self.schism_prev_time, "ERROR: forcings time not increasing monotonically"
+            # # print(f"self.schism_prev_time = {self.schism_prev_time},  step_time = {step_time}", flush=True)
+            # self.schism_prev_time = step_time
 
             output_ts = int(step_time - self.schism_first_timestep)
-            self.times.append(output_ts)
-            self.schism_vsource.write(f"{output_ts} ")
-            self.schism_vsource.write(" ".join(map(lambda v: "{:g}".format(v), all_elements)))
-            self.schism_vsource.write("\n")
-            self.schism_vsource.flush()
-            # self.queue.put((output_ts, all_elements))
+            output_idx = (output_ts / 3600) - 1
+            self.schism_vsource['time_vsource'][output_idx] = output_ts
+            self.schism_vsource['vsource'][output_idx, :] = all_elements
 
         # print(f"FECPP wrote {(self.times[-1] - self.times[0]) / 3600.0 } hours of data to vsource.th", flush=True)
 
@@ -247,7 +217,7 @@ class CoastalPreprocessorApp(object):
 
             in_field = ESMF.Field(grid=self.in_grid, name=f"{variable}-in")
             y_lbounds, y_ubounds, x_lbounds, x_ubounds = self.in_bounds
-            
+
             in_field.data[...] = nc_var[0, :].T[x_lbounds:x_ubounds, y_lbounds:y_ubounds]
 
             out_field = ESMF.Field(grid=self.out_grid, name=f"{variable}-out")
@@ -314,7 +284,7 @@ class CoastalPreprocessorApp(object):
         xlon = ds.variables['XLONG_M'][0, :].T
         clat = ds.variables['XLAT_C'][0, :].T
         clon = ds.variables['XLONG_C'][0, :].T
-        
+
         self.in_grid, self.in_bounds = self._build_grid_(xlat, xlon, clat, clon)
 
     def _setup_latlon_grid_(self, ds: Dataset):
@@ -342,7 +312,7 @@ class CoastalPreprocessorApp(object):
         longitudes, latitudes = np.meshgrid(self.lons, self.lats, indexing="ij")
 
         self.out_grid, self.out_bounds = self._build_grid_(latitudes, longitudes)
-        
+
     @staticmethod
     def _find_lat_lon_ranges_(node_coords):
         g_lon_min = np.empty([1], dtype=np.float32)
@@ -400,4 +370,22 @@ class CoastalPreprocessorApp(object):
             lat_corners[...] = latc_par
 
         return grid, (y_lbounds, y_ubounds, x_lbounds, x_ubounds)
-        
+
+    @staticmethod
+    def _build_source_nc(ds, ntimes, elems):
+        nelems = len(elems)
+
+        # dimensions
+        ds.createDimension('time_vsource', ntimes)
+        ds.createDimension('nsources', nelems)
+
+        ds.createDimension('one', 1)
+
+        # variables
+        eso = ds.createVariable('source_elem', 'i4', ('nsources',))
+        _ = ds.createVariable('vsource', 'f8', ('time_vsource', 'nsources',), zlib=True)
+        _ = ds.createVariable('time_vsource', 'f8', ('time_vsource',))
+        vts = ds.createVariable('time_step_vsource', 'f4', ('one',))
+
+        eso[:] = elems
+        vts[:] = 3600
