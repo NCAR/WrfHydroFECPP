@@ -19,8 +19,8 @@ class CoastalPreprocessorApp(object):
         self.input_dir = input_dir
         self.output_dir = output_dir
 
-        # self.job_idx = os.environ.get("FECPP_JOB_INDEX")
-        # self.job_count = os.environ.get("FECPP_JOB_COUNT")
+        self.job_idx = os.environ.get("FECPP_JOB_INDEX")
+        self.job_count = os.environ.get("FECPP_JOB_COUNT")
 
         self.root = ESMF.local_pet() == 0
         self.schism_mesh = ESMF.Mesh(filename=str(schism_mesh), filetype=ESMF.FileFormat.ESMFMESH)
@@ -45,6 +45,14 @@ class CoastalPreprocessorApp(object):
     def regrid_all_files(self, output_path_transformer, var_filter=None, file_filter=None):
         input_files = sorted(self.input_dir.glob(file_filter))
         file_zero = input_files[0]
+        if self.job_idx is not None:
+            idx = int(self.job_idx)
+            jobs = int(self.job_count)
+            count = math.ceil(len(input_files) / jobs)
+            sub_input_files = input_files[idx*count: idx*count+count]
+        else:
+            idx = 0
+            sub_input_files = input_files
 
         if self.root:
             input_ds = Dataset(file_zero)
@@ -58,17 +66,20 @@ class CoastalPreprocessorApp(object):
             self.schism_first_timestep = start_time
             input_ds.close()
 
-            # open netCDF vsource file and create header
-            self.schism_vsource = Dataset(Path(self.output_dir / "precip_source.nc"), 'w', format="NETCDF4")
-            self._build_source_nc(self.schism_vsource, ntimes=len(input_files), elems=np.arange(1, self.total_elements+1))
+            # open netCDF vsource file and create header (if we're idx=0)
+            if idx == 0:
+                self.schism_vsource = Dataset(Path(self.output_dir / "precip_source.nc"), 'w', format="NETCDF4")
+                self._build_source_nc(self.schism_vsource, ntimes=len(input_files), elems=np.arange(1, self.total_elements+1))
 
         for file in input_files:
-            if self.root:
-                print(f"Post-processing file: {file}", flush=True)
-            self.regrid_to_lat_lon(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
-            self.regrid_to_schism(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
+            if file in sub_input_files:             # only process our task's subset
+                if self.root:
+                    print(f"Post-processing file: {file}", flush=True)
+                self.regrid_to_lat_lon(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
+            if idx == 0:                            # only do precip regridding on a single job array task
+                self.regrid_to_schism(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
 
-        if self.root:
+        if idx == 0 and self.root:
             self.schism_vsource.sync()
             self.schism_vsource.close()
 
@@ -144,6 +155,7 @@ class CoastalPreprocessorApp(object):
             output_idx = (output_ts / 3600) - 1
             self.schism_vsource['time_vsource'][output_idx] = output_ts
             self.schism_vsource['vsource'][output_idx, :] = all_elements
+            self.schism_vsource.sync()
 
         # print(f"FECPP wrote {(self.times[-1] - self.times[0]) / 3600.0 } hours of data to vsource.th", flush=True)
 
