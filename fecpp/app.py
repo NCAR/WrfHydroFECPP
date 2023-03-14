@@ -57,7 +57,7 @@ class CoastalPreprocessorApp(object):
         if self.root:
             input_ds = Dataset(file_zero)
 
-            # TODO: we really should read actual time unit from metadata using udunits, etc.            
+            # TODO: we really should read actual time unit from metadata using udunits, etc.
             if 'time' in input_ds.variables:
                 start_time = input_ds['time'][0] * 60        # in minutes
             if 'valid_time' in input_ds.variables:
@@ -139,7 +139,7 @@ class CoastalPreprocessorApp(object):
 
         #   write field data to `vsource.th.2`
         if self.root:
-            # TODO: we really should read actual time unit from metadata using udunits, etc.       
+            # TODO: we really should read actual time unit from metadata using udunits, etc.
             if 'time' in input_ds.variables:
                 step_time = input_ds['time'][0] * 60        # in minutes
             if 'valid_time' in input_ds.variables:
@@ -152,7 +152,7 @@ class CoastalPreprocessorApp(object):
             # self.schism_prev_time = step_time
 
             output_ts = int(step_time - self.schism_first_timestep)
-            output_idx = (output_ts / 3600) - 1
+            output_idx = (output_ts / 3600)
             self.schism_vsource['time_vsource'][output_idx] = output_ts
             self.schism_vsource['vsource'][output_idx, :] = all_elements
             self.schism_vsource.sync()
@@ -268,7 +268,7 @@ class CoastalPreprocessorApp(object):
             time_coord[:] = in_time[:]
             output_ds.close()
         input_ds.close()
-        
+
     def make_schism_aux_inputs(self):
         if self.job_idx is None or int(self.job_idx) == 0:
             with open(self.output_dir / 'source_sink.in.2', 'w') as o:
