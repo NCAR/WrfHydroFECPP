@@ -42,7 +42,7 @@ class CoastalPreprocessorApp(object):
         self._schism_regridder = None
         self.times = []
 
-    def regrid_all_files(self, output_path_transformer, var_filter=None, file_filter=None):
+    def regrid_all_files(self, output_path_transformer, var_filter=None, file_filter=None, skip_latlon=False):
         input_files = sorted(self.input_dir.glob(file_filter))
         file_zero = input_files[0]
         if self.job_idx is not None:
@@ -72,10 +72,11 @@ class CoastalPreprocessorApp(object):
                 self._build_source_nc(self.schism_vsource, ntimes=len(input_files), elems=np.arange(1, self.total_elements+1))
 
         for file in input_files:
-            if file in sub_input_files:             # only process our task's subset
-                if self.root:
-                    print(f"Post-processing file: {file}", flush=True)
-                self.regrid_to_lat_lon(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
+            if not skip_latlon:
+                if file in sub_input_files:             # only process our task's subset
+                    if self.root:
+                        print(f"Post-processing file: {file}", flush=True)
+                    self.regrid_to_lat_lon(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
             if idx == 0:                            # only do precip regridding on a single job array task
                 self.regrid_to_schism(file, output_path_transformer=output_path_transformer, var_filter=var_filter)
 
@@ -243,7 +244,6 @@ class CoastalPreprocessorApp(object):
                 self._regridder = ESMF.Regrid(srcfield=in_field, dstfield=out_field,
                                               regrid_method=ESMF.RegridMethod.BILINEAR,
                                               unmapped_action=ESMF.UnmappedAction.IGNORE)
-                                              # extrap_method=ESMF.ExtrapMethod.NEAREST_IDAVG)
             else:
                 self._regridder(srcfield=in_field, dstfield=out_field, zero_region=ESMF.constants.Region.SELECT)
 

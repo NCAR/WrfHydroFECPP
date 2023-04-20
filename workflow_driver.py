@@ -35,7 +35,8 @@ def main():
     app = CoastalPreprocessorApp(input_path, output_path, Path(os.environ["GEOGRID_FILE"]), schism_mesh=schism_mesh)
     app.regrid_all_files(output_path_transformer=lambda x: output_path / (x.stem + ".latlon.nc"),
                          var_filter=SeaLevelPressure,
-                         file_filter="**/*LDASIN_DOMAIN*")
+                         file_filter="**/*LDASIN_DOMAIN*",
+                         skip_latlon=True)
 
 
 if __name__ == '__main__':
