@@ -4,7 +4,11 @@ import math
 from threading import Thread
 from queue import Queue
 
-import ESMF
+try:
+    import ESMF
+except ImportError:
+    import esmpy as ESMF
+
 import numpy as np
 from netCDF4 import Dataset, default_fillvals
 

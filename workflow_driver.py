@@ -1,7 +1,11 @@
 from pathlib import Path
 import os
 
-import ESMF
+try:
+    import ESMF
+except ImportError:
+    import esmpy as ESMF
+
 from mpi4py import MPI
 
 from fecpp.app import CoastalPreprocessorApp
